@@ -1,16 +1,21 @@
 import os
+import re
 import math
 import torch
 import torch.nn as nn
 import sentencepiece as spm
+import ahocorasick
+from supabase import create_client
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="CS Translation Service")
+# จำกัด PyTorch ให้ใช้ 1 Thread ป้องกัน OOM และ CPU contention บน Render
 torch.set_num_threads(1)
 
+app = FastAPI(title="Fast CS Translation API")
+
 # ---------------------------------------------------------------------------
-# 1. นิยามโครงสร้างโมเดล (ตรงกับ Cell 6 ใน Notebook)
+# 1. โครงสร้างสถาปัตยกรรมโมเดล (RNN-Augmented Transformer)
 # ---------------------------------------------------------------------------
 PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
 MAX_LEN = 128
@@ -142,12 +147,11 @@ class RNNAugmentedTransformer(nn.Module):
         return self.output_proj(x)
 
 # ---------------------------------------------------------------------------
-# 2. โหลด Tokenizer และ Model Weights
+# 2. เตรียม Tokenizer และ Weights
 # ---------------------------------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 SPM_PATH = "sp_en_th.model"
-MODEL_PATH = "best_model.pt"
+MODEL_PATH = "best_model.pt"  # ใช้ best_model.pt เพื่อคงไวยากรณ์หลักที่แม่นยำ
 
 if not os.path.exists(SPM_PATH):
     raise FileNotFoundError(f"Missing {SPM_PATH}")
@@ -159,12 +163,51 @@ if os.path.exists(MODEL_PATH):
     ckpt = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"Loaded weights from {MODEL_PATH}")
+    print(f"[Model] โหลด Weights สำเร็จจาก {MODEL_PATH}")
 else:
     raise FileNotFoundError(f"Missing {MODEL_PATH}")
 
 # ---------------------------------------------------------------------------
-# 3. Translation Logic (จาก Cell 11)
+# 3. โหลดคลังคำศัพท์เฉพาะทางจาก Supabase ด้วย Aho-Corasick Automaton
+# ---------------------------------------------------------------------------
+AHO_TREE = ahocorasick.Automaton()
+GLOSSARY_LOOKUP = {}
+
+def init_supabase_glossary():
+    # ดึงค่า URL และ Key จาก Environment (หรือใส่ค่าเริ่มต้นไว้เป็น fallback)
+    sb_url = os.environ.get("SUPABASE_URL", "https://hefytemsjkescpihahsg.supabase.co")[cite: 1]
+    sb_key = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhlZnl0ZW1zamtlc2NwaWhhaHNnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5NDM5MTQsImV4cCI6MjA5MzUxOTkxNH0.K7rq1n6eodsRT9nxw0YOjLDBIB0WcoghiB3FqlYodbg")[cite: 1]
+
+    try:
+        supabase = create_client(sb_url, sb_key)
+        res = supabase.table("cs_dictionary").select("term, explanation_th").execute()[cite: 1]
+        data = res.data if hasattr(res, "data") else []
+
+        count = 0
+        for row in data:
+            term = row.get("term", "").strip().lower()
+            explanation = row.get("explanation_th", "").strip()
+            if term and explanation:
+                # คำอธิบายยาวมักมีวงเล็บหรือคำขยาย ให้เลือกเฉพาะคำแปลหลักด้านหน้า
+                clean_th = re.split(r'[,( หมายถึง คือ]', explanation)[0].strip()
+                target_meaning = clean_th if clean_th else explanation
+                
+                AHO_TREE.add_word(term, (term, target_meaning))
+                GLOSSARY_LOOKUP[term] = target_meaning
+                count += 1
+
+        if count > 0:
+            AHO_TREE.make_automaton()
+            print(f"[Glossary] โหลดคำศัพท์เฉพาะทางจาก Supabase สำเร็จ: {count} คำ")
+        else:
+            print("[Glossary] ไม่พบข้อมูลคำศัพท์ในฐานข้อมูล")
+    except Exception as e:
+        print(f"[Glossary Warning] ไม่สามารถเชื่อมต่อ Supabase ได้: {e}")
+
+init_supabase_glossary()
+
+# ---------------------------------------------------------------------------
+# 4. Greedy Decode พร้อมระบบป้องกันคำซ้ำ
 # ---------------------------------------------------------------------------
 def encode_text(text: str):
     ids = sp.encode(text, out_type=int)
@@ -178,22 +221,13 @@ def decode_ids(ids):
 def greedy_translate(
     src_ids: list[int],
     max_new_tokens: int = 100,
-    repetition_penalty: float = 1.35,  # ค่ามาตรฐาน 1.2 - 1.5 ลงโทษคำที่เคยพูดไปแล้ว
-    no_repeat_ngram_size: int = 3,     # ห้ามซ้ำกลุ่มคำติดกัน 3 token โดยเด็ดขาด
+    repetition_penalty: float = 1.35,
+    no_repeat_ngram_size: int = 3,
 ):
-    """
-    Greedy Decode พร้อมระบบป้องกันคำซ้ำระดับ Production:
-    - Multiplicative Repetition Penalty
-    - Strict N-gram Blocking
-    """
     src = torch.tensor([src_ids], dtype=torch.long, device=device)
     memory, memory_key_padding_mask = model.encode(src)
 
-    # คำนวณขีดจำกัด token สูงสุดตามความยาวของ input (ป้องกันการ hallucinate ลากยาว)
-    # ประโยคแปลไทยมักไม่ยาวเกิน 2.5 เท่าของ source
-    input_len = len(src_ids)
-    dynamic_limit = min(int(input_len * 2.5) + 10, max_new_tokens, MAX_LEN - 1)
-
+    dynamic_limit = min(int(len(src_ids) * 2.5) + 10, max_new_tokens, MAX_LEN - 1)
     tgt_ids = [BOS_ID]
     generated_tokens = []
 
@@ -202,16 +236,12 @@ def greedy_translate(
         logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
         next_token_logits = logits[0, -1, :].clone()
 
-        # -------------------------------------------------------------
-        # 1. Multiplicative Repetition Penalty (HuggingFace Standard)
-        # -------------------------------------------------------------
+        # Multiplicative Repetition Penalty
         if repetition_penalty != 1.0 and len(generated_tokens) > 0:
             token_counts = torch.bincount(
                 torch.tensor(generated_tokens, dtype=torch.long),
                 minlength=next_token_logits.size(0)
             ).to(device)
-            
-            # Token ที่เคยออกไปแล้ว หาก logit > 0 ให้หารออก / หาก logit < 0 ให้คูณเพิ่ม
             penalty_mask = token_counts > 0
             next_token_logits = torch.where(
                 penalty_mask & (next_token_logits > 0),
@@ -224,23 +254,17 @@ def greedy_translate(
                 next_token_logits
             )
 
-        # -------------------------------------------------------------
-        # 2. Strict N-gram Blocking (ป้องกันการวนลูปประโยคซ้ำ)
-        # -------------------------------------------------------------
+        # Strict N-gram Blocking (ห้ามซ้ำกลุ่มคำ 3 token)
         if no_repeat_ngram_size > 0 and len(tgt_ids) >= no_repeat_ngram_size:
-            # เก็บ n-gram ย้อนหลัง
             ngram_prefix = tuple(tgt_ids[-(no_repeat_ngram_size - 1):])
             banned_tokens = set()
-            
             for i in range(len(tgt_ids) - no_repeat_ngram_size + 1):
                 prev_ngram = tuple(tgt_ids[i : i + no_repeat_ngram_size - 1])
                 if prev_ngram == ngram_prefix:
                     banned_tokens.add(tgt_ids[i + no_repeat_ngram_size - 1])
-            
-            for b_token in banned_tokens:
-                next_token_logits[b_token] = -float("inf")
+            for b_tok in banned_tokens:
+                next_token_logits[b_tok] = -float("inf")
 
-        # ห้ามเลือก UNK_ID หรือ PAD_ID
         next_token_logits[UNK_ID] = -float("inf")
         next_token_logits[PAD_ID] = -float("inf")
 
@@ -254,7 +278,51 @@ def greedy_translate(
     return decode_ids(tgt_ids)
 
 # ---------------------------------------------------------------------------
-# 4. API Endpoints
+# 5. Core Translation Pipeline ผสาน Database อัตโนมัติ
+# ---------------------------------------------------------------------------
+def translate_pipeline(text: str) -> str:
+    text_lower = text.lower()
+    matched_terms = []
+
+    # ตรวจหาศัพท์เฉพาะทางด้วย Aho-Corasick ในรอบเดียว
+    if len(GLOSSARY_LOOKUP) > 0:
+        for end_index, (term, th_val) in AHO_TREE.iter(text_lower):
+            start_index = end_index - len(term) + 1
+            # ตรวจสอบขอบเขตคำ (Word Boundary) เพื่อไม่ให้ match กลางคำ
+            is_start_ok = (start_index == 0) or not text_lower[start_index - 1].isalnum()
+            is_end_ok = (end_index == len(text_lower) - 1) or not text_lower[end_index + 1].isalnum()
+            if is_start_ok and is_end_ok:
+                matched_terms.append((start_index, end_index, term, th_val))
+
+    # เรียงลำดับคำที่ยาวกว่าให้มีความสำคัญสูงกว่า (Longest-match first)
+    matched_terms.sort(key=lambda x: (x[1] - x[0]), reverse=True)
+
+    # กรองคำที่ทับซ้อนกันออก
+    filtered_matches = []
+    occupied = set()
+    for start, end, term, th_val in matched_terms:
+        span = set(range(start, end + 1))
+        if not span.intersection(occupied):
+            filtered_matches.append((start, end, term, th_val))
+            occupied.update(span)
+
+    # ส่งประโยคเข้าแปลด้วยโมเดล PyTorch
+    src_ids = encode_text(text)
+    raw_translation = greedy_translate(src_ids)
+
+    # ปรับปรุงผลลัพธ์ด้วยศัพท์เฉพาะทางจากฐานข้อมูล
+    final_translation = raw_translation
+    for _, _, term, th_val in filtered_matches:
+        # แทนที่คำแปลคลาดเคลื่อน เช่น 'ซอฟต์แวร์' เป็น 'เซิร์ฟเวอร์'
+        # หรือถ้าโมเดลทับศัพท์ภาษาอังกฤษหลงมา ให้เปลี่ยนเป็นภาษาไทยจาก DB
+        term_pattern = re.compile(re.escape(term), re.IGNORECASE)
+        if term_pattern.search(final_translation):
+            final_translation = term_pattern.sub(th_val, final_translation)
+
+    return final_translation
+
+# ---------------------------------------------------------------------------
+# 6. API Endpoint
 # ---------------------------------------------------------------------------
 class TranslationRequest(BaseModel):
     text: str
@@ -264,9 +332,9 @@ class TranslationResponse(BaseModel):
 
 @app.post("/translate", response_model=TranslationResponse)
 def translate_endpoint(req: TranslationRequest):
-    if not req.text.strip():
+    cleaned_input = req.text.strip()
+    if not cleaned_input:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     
-    src_ids = encode_text(req.text)
-    translated = greedy_translate(src_ids)
-    return TranslationResponse(translated_text=translated)
+    result = translate_pipeline(cleaned_input)
+    return TranslationResponse(translated_text=result)
