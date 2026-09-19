@@ -175,23 +175,79 @@ def decode_ids(ids):
     return sp.decode(clean_ids)
 
 @torch.inference_mode()
-def greedy_translate(src_ids, max_new_tokens=150, no_repeat_last_n=3, repetition_penalty_value=5.0):
+def greedy_translate(
+    src_ids: list[int],
+    max_new_tokens: int = 100,
+    repetition_penalty: float = 1.35,  # ค่ามาตรฐาน 1.2 - 1.5 ลงโทษคำที่เคยพูดไปแล้ว
+    no_repeat_ngram_size: int = 3,     # ห้ามซ้ำกลุ่มคำติดกัน 3 token โดยเด็ดขาด
+):
+    """
+    Greedy Decode พร้อมระบบป้องกันคำซ้ำระดับ Production:
+    - Multiplicative Repetition Penalty
+    - Strict N-gram Blocking
+    """
     src = torch.tensor([src_ids], dtype=torch.long, device=device)
     memory, memory_key_padding_mask = model.encode(src)
-    safe_max_len = min(max_new_tokens, MAX_LEN - 1)
+
+    # คำนวณขีดจำกัด token สูงสุดตามความยาวของ input (ป้องกันการ hallucinate ลากยาว)
+    # ประโยคแปลไทยมักไม่ยาวเกิน 2.5 เท่าของ source
+    input_len = len(src_ids)
+    dynamic_limit = min(int(input_len * 2.5) + 10, max_new_tokens, MAX_LEN - 1)
 
     tgt_ids = [BOS_ID]
-    for _ in range(safe_max_len):
+    generated_tokens = []
+
+    for _ in range(dynamic_limit):
         tgt = torch.tensor([tgt_ids], dtype=torch.long, device=device)
         logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
         next_token_logits = logits[0, -1, :].clone()
 
-        recent = tgt_ids[-no_repeat_last_n:] if len(tgt_ids) >= no_repeat_last_n else tgt_ids
-        for tok in set(recent):
-            next_token_logits[tok] -= repetition_penalty_value
+        # -------------------------------------------------------------
+        # 1. Multiplicative Repetition Penalty (HuggingFace Standard)
+        # -------------------------------------------------------------
+        if repetition_penalty != 1.0 and len(generated_tokens) > 0:
+            token_counts = torch.bincount(
+                torch.tensor(generated_tokens, dtype=torch.long),
+                minlength=next_token_logits.size(0)
+            ).to(device)
+            
+            # Token ที่เคยออกไปแล้ว หาก logit > 0 ให้หารออก / หาก logit < 0 ให้คูณเพิ่ม
+            penalty_mask = token_counts > 0
+            next_token_logits = torch.where(
+                penalty_mask & (next_token_logits > 0),
+                next_token_logits / (repetition_penalty ** token_counts.float()),
+                next_token_logits
+            )
+            next_token_logits = torch.where(
+                penalty_mask & (next_token_logits <= 0),
+                next_token_logits * (repetition_penalty ** token_counts.float()),
+                next_token_logits
+            )
+
+        # -------------------------------------------------------------
+        # 2. Strict N-gram Blocking (ป้องกันการวนลูปประโยคซ้ำ)
+        # -------------------------------------------------------------
+        if no_repeat_ngram_size > 0 and len(tgt_ids) >= no_repeat_ngram_size:
+            # เก็บ n-gram ย้อนหลัง
+            ngram_prefix = tuple(tgt_ids[-(no_repeat_ngram_size - 1):])
+            banned_tokens = set()
+            
+            for i in range(len(tgt_ids) - no_repeat_ngram_size + 1):
+                prev_ngram = tuple(tgt_ids[i : i + no_repeat_ngram_size - 1])
+                if prev_ngram == ngram_prefix:
+                    banned_tokens.add(tgt_ids[i + no_repeat_ngram_size - 1])
+            
+            for b_token in banned_tokens:
+                next_token_logits[b_token] = -float("inf")
+
+        # ห้ามเลือก UNK_ID หรือ PAD_ID
+        next_token_logits[UNK_ID] = -float("inf")
+        next_token_logits[PAD_ID] = -float("inf")
 
         next_token = torch.argmax(next_token_logits).item()
         tgt_ids.append(next_token)
+        generated_tokens.append(next_token)
+
         if next_token == EOS_ID:
             break
 
