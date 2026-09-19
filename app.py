@@ -6,7 +6,8 @@ import torch.nn as nn
 import sentencepiece as spm
 import ahocorasick
 from supabase import create_client
-from fastapi import FastAPI, HTTPException, CORSMiddleware
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # จำกัด PyTorch ให้ใช้ 1 Thread ป้องกัน OOM และ CPU contention บน Render
