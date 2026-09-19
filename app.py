@@ -147,7 +147,7 @@ class RNNAugmentedTransformer(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SPM_PATH = "sp_en_th.model"
-MODEL_PATH = "finetuned_model.pt" if os.path.exists("finetuned_model.pt") else "best_model.pt"
+MODEL_PATH = "best_model.pt"
 
 if not os.path.exists(SPM_PATH):
     raise FileNotFoundError(f"Missing {SPM_PATH}")
