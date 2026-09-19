@@ -278,49 +278,59 @@ def greedy_translate(
     return decode_ids(tgt_ids)
 
 # ---------------------------------------------------------------------------
-# 5. Core Translation Pipeline ผสาน Database อัตโนมัติ
+# 5. Core Translation Pipeline ผสาน Database อัตโนมัติ (ฉบับแก้ปัญหา)
 # ---------------------------------------------------------------------------
 def translate_pipeline(text: str) -> str:
-    text_lower = text.lower()
-    matched_terms = []
+  text_lower = text.lower()
+  matched_terms = []
 
-    # ตรวจหาศัพท์เฉพาะทางด้วย Aho-Corasick ในรอบเดียว
-    if len(GLOSSARY_LOOKUP) > 0:
-        for end_index, (term, th_val) in AHO_TREE.iter(text_lower):
-            start_index = end_index - len(term) + 1
-            # ตรวจสอบขอบเขตคำ (Word Boundary) เพื่อไม่ให้ match กลางคำ
-            is_start_ok = (start_index == 0) or not text_lower[start_index - 1].isalnum()
-            is_end_ok = (end_index == len(text_lower) - 1) or not text_lower[end_index + 1].isalnum()
-            if is_start_ok and is_end_ok:
-                matched_terms.append((start_index, end_index, term, th_val))
+  # 1. ตรวจหาคำศัพท์เฉพาะทางจาก Aho-Corasick Automaton
+  if len(GLOSSARY_LOOKUP) > 0:
+    for end_index, (term, th_val) in AHO_TREE.iter(text_lower):
+      start_index = end_index - len(term) + 1
+      is_start_ok = (start_index == 0) or not text_lower[
+          start_index - 1
+      ].isalnum()
+      is_end_ok = (end_index == len(text_lower) - 1) or not text_lower[
+          end_index + 1
+      ].isalnum()
+      if is_start_ok and is_end_ok:
+        matched_terms.append((start_index, end_index, term, th_val))
 
-    # เรียงลำดับคำที่ยาวกว่าให้มีความสำคัญสูงกว่า (Longest-match first)
-    matched_terms.sort(key=lambda x: (x[1] - x[0]), reverse=True)
+  # เรียงลำดับคำยาวขึ้นก่อน ป้องกันการชนกันของคำประสม
+  matched_terms.sort(key=lambda x: (x[1] - x[0]), reverse=True)
 
-    # กรองคำที่ทับซ้อนกันออก
-    filtered_matches = []
-    occupied = set()
-    for start, end, term, th_val in matched_terms:
-        span = set(range(start, end + 1))
-        if not span.intersection(occupied):
-            filtered_matches.append((start, end, term, th_val))
-            occupied.update(span)
+  # กรองช่วงคำที่ทับซ้อนกันออก
+  filtered_matches = []
+  occupied = set()
+  for start, end, term, th_val in matched_terms:
+    span = set(range(start, end + 1))
+    if not span.intersection(occupied):
+      filtered_matches.append((start, end, term, th_val))
+      occupied.update(span)
 
-    # ส่งประโยคเข้าแปลด้วยโมเดล PyTorch
-    src_ids = encode_text(text)
-    raw_translation = greedy_translate(src_ids)
+  # เรียงตามลำดับตำแหน่งในประโยคจากหลังมาหน้า เพื่อแทนที่ Placeholder โดยไม่กระทบ Index
+  filtered_matches.sort(key=lambda x: x[0], reverse=True)
 
-    # ปรับปรุงผลลัพธ์ด้วยศัพท์เฉพาะทางจากฐานข้อมูล
-    final_translation = raw_translation
-    for _, _, term, th_val in filtered_matches:
-        # แทนที่คำแปลคลาดเคลื่อน เช่น 'ซอฟต์แวร์' เป็น 'เซิร์ฟเวอร์'
-        # หรือถ้าโมเดลทับศัพท์ภาษาอังกฤษหลงมา ให้เปลี่ยนเป็นภาษาไทยจาก DB
-        term_pattern = re.compile(re.escape(term), re.IGNORECASE)
-        if term_pattern.search(final_translation):
-            final_translation = term_pattern.sub(th_val, final_translation)
+  placeholder_map = {}
+  masked_text = text
+  for i, (start, end, term, th_val) in enumerate(filtered_matches):
+    placeholder = f"XTERM{i}X"
+    placeholder_map[placeholder] = th_val
+    masked_text = masked_text[:start] + placeholder + masked_text[end + 1 :]
 
-    return final_translation
+  # 2. ส่งประโยคที่ Mask แล้วเข้าโมเดล
+  src_ids = encode_text(masked_text)
+  translated = greedy_translate(src_ids)
 
+  # 3. นำคำแปลจาก Database ใส่กลับคืนแทน Placeholder
+  final_translated = translated
+  for placeholder, th_meaning in placeholder_map.items():
+    # ใช้ Regex ค้นหา placeholder แบบยืดหยุ่น (เผื่อโมเดลเว้นวรรคหรือเปลี่ยนเป็นตัวพิมพ์เล็ก)
+    pattern = re.compile(re.escape(placeholder), re.IGNORECASE)
+    final_translated = pattern.sub(th_meaning, final_translated)
+
+  return final_translated
 # ---------------------------------------------------------------------------
 # 6. API Endpoint
 # ---------------------------------------------------------------------------
