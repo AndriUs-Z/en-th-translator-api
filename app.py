@@ -6,13 +6,26 @@ import torch.nn as nn
 import sentencepiece as spm
 import ahocorasick
 from supabase import create_client
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, CORSMiddleware
 from pydantic import BaseModel
 
 # จำกัด PyTorch ให้ใช้ 1 Thread ป้องกัน OOM และ CPU contention บน Render
 torch.set_num_threads(1)
 
 app = FastAPI(title="Fast CS Translation API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # หรือระบุโดเมนของ Frontend
+    allow_credentials=True,
+    allow_methods=["*"],  # อนุญาต OPTIONS, POST, GET ทั้งหมด
+    allow_headers=["*"],
+)
+
+# เพิ่ม endpoint เช็คสถานะ (ป้องกัน 404 GET /health ของ Render)
+@app.get("/health")
+def health_check():
+  return {"status": "healthy"}
 
 # ---------------------------------------------------------------------------
 # 1. โครงสร้างสถาปัตยกรรมโมเดล (RNN-Augmented Transformer)
