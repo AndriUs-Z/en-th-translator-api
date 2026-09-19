@@ -175,12 +175,12 @@ GLOSSARY_LOOKUP = {}
 
 def init_supabase_glossary():
     # ดึงค่า URL และ Key จาก Environment (หรือใส่ค่าเริ่มต้นไว้เป็น fallback)
-    sb_url = os.environ.get("SUPABASE_URL", "https://hefytemsjkescpihahsg.supabase.co")[cite: 1]
+    sb_url = os.environ.get("SUPABASE_URL", "https://hefytemsjkescpihahsg.supabase.co")
     sb_key = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhlZnl0ZW1zamtlc2NwaWhhaHNnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5NDM5MTQsImV4cCI6MjA5MzUxOTkxNH0.K7rq1n6eodsRT9nxw0YOjLDBIB0WcoghiB3FqlYodbg")[cite: 1]
 
     try:
         supabase = create_client(sb_url, sb_key)
-        res = supabase.table("cs_dictionary").select("term, explanation_th").execute()[cite: 1]
+        res = supabase.table("cs_dictionary").select("term, explanation_th").execute()
         data = res.data if hasattr(res, "data") else []
 
         count = 0
