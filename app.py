@@ -354,11 +354,19 @@ class TranslationRequest(BaseModel):
 class TranslationResponse(BaseModel):
     translated_text: str
 
-@app.post("/translate", response_model=TranslationResponse)
+@app.post("/translate")
 def translate_endpoint(req: TranslationRequest):
-    cleaned_input = req.text.strip()
-    if not cleaned_input:
-        raise HTTPException(status_code=400, detail="Text cannot be empty")
-    
-    result = translate_pipeline(cleaned_input)
-    return TranslationResponse(translated_text=result)
+  cleaned_input = req.text.strip()
+  if not cleaned_input:
+    raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+  # 1. ส่งคำภาษาอังกฤษเข้า Tokenizer และ Model ตรงๆ
+  src_ids = encode_text(cleaned_input)
+  translated = greedy_translate(src_ids)
+
+  # 2. ตอบกลับผลลัพธ์ทันที
+  return {
+      "translated_text": translated,
+      "translation": translated,
+      "result": translated,
+  }
