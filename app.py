@@ -180,13 +180,13 @@ def init_supabase_glossary():
 
     try:
         supabase = create_client(sb_url, sb_key)
-        res = supabase.table("cs_dictionary").select("term, explanation_th").execute()
+        res = supabase.table("cs_dictionary").select("word, description_th").execute()
         data = res.data if hasattr(res, "data") else []
 
         count = 0
         for row in data:
-            term = row.get("term", "").strip().lower()
-            explanation = row.get("explanation_th", "").strip()
+            term = row.get("word", "").strip().lower()
+            explanation = row.get("description_th", "").strip()
             if term and explanation:
                 # คำอธิบายยาวมักมีวงเล็บหรือคำขยาย ให้เลือกเฉพาะคำแปลหลักด้านหน้า
                 clean_th = re.split(r'[,( หมายถึง คือ]', explanation)[0].strip()
