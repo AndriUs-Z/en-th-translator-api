@@ -11,7 +11,7 @@ import sentencepiece as spm
 # ==============================================================================
 # 1. การตั้งค่าระบบและ Hyperparameters
 # ==============================================================================
-app = FastAPI(title="CS/IT English-to-Thai Translation API")
+app = FastAPI(title="CS English-to-Thai Translation API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,11 @@ MAX_LEN = 128
 
 SPM_MODEL_PATH = os.getenv("SPM_MODEL_PATH", "sp_en_th.model")
 # เลือกลำดับไฟล์โมเดล: finetuned_model.pt ก่อน ถ้าไม่มีให้ใช้ best_model.pt
-MODEL_PATH = "finetuned_model.pt" if os.path.exists("finetuned_model.pt") else "best_model.pt"
+MODEL_PATH = (
+    "finetuned_model.pt"
+    if os.path.exists("finetuned_model.pt")
+    else "best_model.pt"
+)
 
 # ==============================================================================
 # 2. โครงสร้างสถาปัตยกรรมโมเดล (RNN-Augmented Transformer)
