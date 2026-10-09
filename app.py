@@ -1,19 +1,29 @@
 import os
+import re
 import math
 import torch
 import torch.nn as nn
-import sentencepiece as spm
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import sentencepiece as spm
 
-app = FastAPI(title="CS Translation Service")
-torch.set_num_threads(1)
+# ==============================================================================
+# 1. การตั้งค่าระบบและ Hyperparameters
+# ==============================================================================
+app = FastAPI(title="CS/IT English-to-Thai Translation API")
 
-# ---------------------------------------------------------------------------
-# 1. นิยามโครงสร้างโมเดล (ตรงกับ Cell 6 ใน Notebook)
-# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
-MAX_LEN = 128
 D_MODEL = 256
 NHEAD = 8
 ENC_GRU_HIDDEN = 64
@@ -22,7 +32,15 @@ NUM_ENCODER_LAYERS = 3
 NUM_DECODER_LAYERS = 3
 DIM_FEEDFORWARD = 512
 DROPOUT = 0.1
+MAX_LEN = 128
 
+SPM_MODEL_PATH = os.getenv("SPM_MODEL_PATH", "sp_en_th.model")
+# เลือกลำดับไฟล์โมเดล: finetuned_model.pt ก่อน ถ้าไม่มีให้ใช้ best_model.pt
+MODEL_PATH = "finetuned_model.pt" if os.path.exists("finetuned_model.pt") else "best_model.pt"
+
+# ==============================================================================
+# 2. โครงสร้างสถาปัตยกรรมโมเดล (RNN-Augmented Transformer)
+# ==============================================================================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=MAX_LEN, dropout=0.1):
         super().__init__()
@@ -50,7 +68,7 @@ class RNNAugmentedEncoderLayer(nn.Module):
             nn.Linear(d_model, dim_feedforward),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
+            nn.Linear(dim_feedforward, d_model)
         )
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -79,7 +97,7 @@ class RNNAugmentedDecoderLayer(nn.Module):
             nn.Linear(d_model, dim_feedforward),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
+            nn.Linear(dim_feedforward, d_model)
         )
         self.norm4 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -120,8 +138,8 @@ class RNNAugmentedTransformer(nn.Module):
     def make_padding_mask(self, seq):
         return (seq == self.pad_id)
 
-    def make_causal_mask(self, size, device):
-        return torch.triu(torch.ones(size, size, device=device), diagonal=1).bool()
+    def make_causal_mask(self, size, dev):
+        return torch.triu(torch.ones(size, size, device=dev), diagonal=1).bool()
 
     def encode(self, src):
         src_key_padding_mask = self.make_padding_mask(src)
@@ -139,134 +157,148 @@ class RNNAugmentedTransformer(nn.Module):
         for layer in self.decoder_layers:
             x = layer(x, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask,
                       memory_key_padding_mask=memory_key_padding_mask)
-        return self.output_proj(x)
+        logits = self.output_proj(x)
+        return logits
 
-# ---------------------------------------------------------------------------
-# 2. โหลด Tokenizer และ Model Weights
-# ---------------------------------------------------------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ==============================================================================
+# 3. โหลด Tokenizer และ Model Weights
+# ==============================================================================
+if not os.path.exists(SPM_MODEL_PATH):
+    raise FileNotFoundError(f"ไม่พบไฟล์ Tokenizer: {SPM_MODEL_PATH}")
 
-SPM_PATH = "sp_en_th.model"
-MODEL_PATH = "finetuned_model.pt" if os.path.exists("finetuned_model.pt") else "best_model.pt"
+sp = spm.SentencePieceProcessor(model_file=SPM_MODEL_PATH)
 
-if not os.path.exists(SPM_PATH):
-    raise FileNotFoundError(f"Missing {SPM_PATH}")
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"ไม่พบไฟล์ Model: {MODEL_PATH}")
 
-sp = spm.SentencePieceProcessor(model_file=SPM_PATH)
 model = RNNAugmentedTransformer(vocab_size=sp.get_piece_size()).to(device)
+checkpoint = torch.load(MODEL_PATH, map_location=device)
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+print(f"โหลดโมเดลสำเร็จจาก {MODEL_PATH} (Vocab size: {sp.get_piece_size()})")
 
-if os.path.exists(MODEL_PATH):
-    ckpt = torch.load(MODEL_PATH, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    print(f"Loaded weights from {MODEL_PATH}")
-else:
-    raise FileNotFoundError(f"Missing {MODEL_PATH}")
-
-# ---------------------------------------------------------------------------
-# 3. Translation Logic (จาก Cell 11)
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# 4. ฟังก์ชันช่วยเหลือและ Inference Engine
+# ==============================================================================
 def encode_text(text: str):
     ids = sp.encode(text, out_type=int)
-    return ([BOS_ID] + ids + [EOS_ID])[:MAX_LEN]
+    ids = [BOS_ID] + ids + [EOS_ID]
+    return ids[:MAX_LEN]
 
 def decode_ids(ids):
     clean_ids = [i for i in ids if i not in (PAD_ID, BOS_ID, EOS_ID)]
     return sp.decode(clean_ids)
 
-@torch.inference_mode()
-def greedy_translate(
-    src_ids: list[int],
-    max_new_tokens: int = 100,
-    repetition_penalty: float = 1.35,  # ค่ามาตรฐาน 1.2 - 1.5 ลงโทษคำที่เคยพูดไปแล้ว
-    no_repeat_ngram_size: int = 3,     # ห้ามซ้ำกลุ่มคำติดกัน 3 token โดยเด็ดขาด
-):
-    """
-    Greedy Decode พร้อมระบบป้องกันคำซ้ำระดับ Production:
-    - Multiplicative Repetition Penalty
-    - Strict N-gram Blocking
-    """
+def get_banned_ngram_tokens(generated_ids, ngram_size):
+    if len(generated_ids) < ngram_size - 1:
+        return set()
+    prefix = tuple(generated_ids[-(ngram_size - 1):])
+    banned = set()
+    for i in range(len(generated_ids) - ngram_size + 1):
+        ngram = tuple(generated_ids[i:i + ngram_size])
+        if ngram[:-1] == prefix:
+            banned.add(ngram[-1])
+    return banned
+
+@torch.no_grad()
+def greedy_translate(src_ids, max_new_tokens=150, no_repeat_ngram_size=3, repetition_penalty=1.3):
     src = torch.tensor([src_ids], dtype=torch.long, device=device)
     memory, memory_key_padding_mask = model.encode(src)
 
-    # คำนวณขีดจำกัด token สูงสุดตามความยาวของ input (ป้องกันการ hallucinate ลากยาว)
-    # ประโยคแปลไทยมักไม่ยาวเกิน 2.5 เท่าของ source
-    input_len = len(src_ids)
-    dynamic_limit = min(int(input_len * 2.5) + 10, max_new_tokens, MAX_LEN - 1)
-
+    safe_max_len = min(max_new_tokens, MAX_LEN - 1)
     tgt_ids = [BOS_ID]
-    generated_tokens = []
 
-    for _ in range(dynamic_limit):
+    for _ in range(safe_max_len):
         tgt = torch.tensor([tgt_ids], dtype=torch.long, device=device)
         logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
         next_token_logits = logits[0, -1, :].clone()
 
-        # -------------------------------------------------------------
-        # 1. Multiplicative Repetition Penalty (HuggingFace Standard)
-        # -------------------------------------------------------------
-        if repetition_penalty != 1.0 and len(generated_tokens) > 0:
-            token_counts = torch.bincount(
-                torch.tensor(generated_tokens, dtype=torch.long),
-                minlength=next_token_logits.size(0)
-            ).to(device)
-            
-            # Token ที่เคยออกไปแล้ว หาก logit > 0 ให้หารออก / หาก logit < 0 ให้คูณเพิ่ม
-            penalty_mask = token_counts > 0
-            next_token_logits = torch.where(
-                penalty_mask & (next_token_logits > 0),
-                next_token_logits / (repetition_penalty ** token_counts.float()),
-                next_token_logits
-            )
-            next_token_logits = torch.where(
-                penalty_mask & (next_token_logits <= 0),
-                next_token_logits * (repetition_penalty ** token_counts.float()),
-                next_token_logits
-            )
+        # Multiplicative Repetition Penalty
+        for tok in set(tgt_ids):
+            if next_token_logits[tok] > 0:
+                next_token_logits[tok] /= repetition_penalty
+            else:
+                next_token_logits[tok] *= repetition_penalty
 
-        # -------------------------------------------------------------
-        # 2. Strict N-gram Blocking (ป้องกันการวนลูปประโยคซ้ำ)
-        # -------------------------------------------------------------
-        if no_repeat_ngram_size > 0 and len(tgt_ids) >= no_repeat_ngram_size:
-            # เก็บ n-gram ย้อนหลัง
-            ngram_prefix = tuple(tgt_ids[-(no_repeat_ngram_size - 1):])
-            banned_tokens = set()
-            
-            for i in range(len(tgt_ids) - no_repeat_ngram_size + 1):
-                prev_ngram = tuple(tgt_ids[i : i + no_repeat_ngram_size - 1])
-                if prev_ngram == ngram_prefix:
-                    banned_tokens.add(tgt_ids[i + no_repeat_ngram_size - 1])
-            
-            for b_token in banned_tokens:
-                next_token_logits[b_token] = -float("inf")
-
-        # ห้ามเลือก UNK_ID หรือ PAD_ID
-        next_token_logits[UNK_ID] = -float("inf")
-        next_token_logits[PAD_ID] = -float("inf")
+        # Strict N-gram Blocking
+        banned = get_banned_ngram_tokens(tgt_ids, no_repeat_ngram_size)
+        for tok in banned:
+            next_token_logits[tok] = float("-inf")
 
         next_token = torch.argmax(next_token_logits).item()
         tgt_ids.append(next_token)
-        generated_tokens.append(next_token)
 
         if next_token == EOS_ID:
             break
 
-    return decode_ids(tgt_ids)
+    return tgt_ids
 
-# ---------------------------------------------------------------------------
-# 4. API Endpoints
-# ---------------------------------------------------------------------------
+def translate_sentence(text: str) -> str:
+    text_clean = text.strip()
+    if not text_clean:
+        return ""
+    src_ids = encode_text(text_clean)
+    out_ids = greedy_translate(src_ids)
+    return decode_ids(out_ids)
+
+def split_document_into_sentences(text: str):
+    paragraphs = text.split("\n")
+    units = []
+    for p in paragraphs:
+        p_clean = p.strip()
+        if not p_clean:
+            units.append(("", True))
+            continue
+        raw_sentences = re.split(r'(?<=[.?!;])\s+', p_clean)
+        for s in raw_sentences:
+            if s.strip():
+                units.append((s.strip(), False))
+        units.append(("", True))
+    return units
+
+def translate_document(document_text: str) -> str:
+    units = split_document_into_sentences(document_text)
+    translated_result = []
+    for sent, is_newline in units:
+        if is_newline:
+            translated_result.append("\n")
+        else:
+            th_sent = translate_sentence(sent)
+            translated_result.append(th_sent + " ")
+    return "".join(translated_result).strip()
+
+# ==============================================================================
+# 5. FastAPI Endpoints
+# ==============================================================================
 class TranslationRequest(BaseModel):
     text: str
 
 class TranslationResponse(BaseModel):
-    translated_text: str
+    original: str
+    translated: str
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "model_loaded": MODEL_PATH,
+        "device": str(device)
+    }
 
 @app.post("/translate", response_model=TranslationResponse)
-def translate_endpoint(req: TranslationRequest):
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty")
-    
-    src_ids = encode_text(req.text)
-    translated = greedy_translate(src_ids)
-    return TranslationResponse(translated_text=translated)
+def api_translate_sentence(req: TranslationRequest):
+    """Endpoint สำหรับแปลประโยคเดี่ยวสั้น ๆ"""
+    try:
+        translated = translate_sentence(req.text)
+        return TranslationResponse(original=req.text, translated=translated)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/translate-document", response_model=TranslationResponse)
+def api_translate_document(req: TranslationRequest):
+    """Endpoint สำหรับแปลเอกสาร, ย่อหน้า, หรือบทความยาวทั้งหน้า"""
+    try:
+        translated = translate_document(req.text)
+        return TranslationResponse(original=req.text, translated=translated)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
