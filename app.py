@@ -200,11 +200,12 @@ def normalize_text_input(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 def postprocess_thai_output(text: str) -> str:
-    """ทำความสะอาดคำแปลภาษาไทยหลัง decode"""
-    # จัดระยะห่างรอบเครื่องหมายคำพูดให้กระชับ
-    text = re.sub(r'\s*"\s*([^"]+?)\s*"\s*', r' "\1" ', text)
-    text = re.sub(r"\s*'\s*([^']+?)\s*'\s*", r" '\1' ", text)
-    return re.sub(r'\s+', ' ', text).strip()
+    """ทำความสะอาดคำแปลภาษาไทยหลัง decode และจัดระยะเครื่องหมายคำพูด"""
+    # จัดช่องว่างรอบเครื่องหมายคำพูดให้มีระยะห่างพอเหมาะ
+    text = re.sub(r'["\']\s*([^"\']+?)\s*["\']', r' "\1" ', text)
+    # ตัดช่องว่างซ้ำซ้อน
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 def encode_text(text: str):
     clean_text = normalize_text_input(text)
