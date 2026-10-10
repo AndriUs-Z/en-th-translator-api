@@ -36,7 +36,6 @@ DROPOUT = 0.1
 MAX_LEN = 128
 
 SPM_MODEL_PATH = os.getenv("SPM_MODEL_PATH", "sp_en_th.model")
-# เลือกลำดับไฟล์โมเดล: finetuned_model.pt ก่อน ถ้าไม่มีให้ใช้ best_model.pt
 MODEL_PATH = (
     "finetuned_model.pt"
     if os.path.exists("finetuned_model.pt")
@@ -183,29 +182,25 @@ model.eval()
 print(f"โหลดโมเดลสำเร็จจาก {MODEL_PATH} (Vocab size: {sp.get_piece_size()})")
 
 # ==============================================================================
-# 4. ฟังก์ชันจัดการ Text Normalization & Post-processing
+# 4. ฟังก์ชัน Normalization & Greedy Inference (เร็ว เบา CPU)
 # ==============================================================================
 def normalize_text_input(text: str) -> str:
-    """
-    แปลง curly quotes และสัญลักษณ์พิเศษให้อยู่ในรูปมาตรฐาน
-    เพื่อป้องกัน Tokenizer เกิดสถานะ <unk> (??)
-    """
+    """แปลงเครื่องหมายคำพูดทุกแบบให้เป็น straight quotes และเว้นวรรคให้ token ได้สะอาด"""
     text = unicodedata.normalize("NFKC", text)
-    # แปลงเครื่องหมายคำพูดโค้งทุกชนิดเป็น straight quotes
+    # แปลง “ ” ‘ ’ ` เป็น " หรือ '
     text = re.sub(r'[“”„«»]', '"', text)
     text = re.sub(r"[‘’`´]", "'", text)
-    # เพิ่มช่องว่างรอบเครื่องหมายคำพูดเพื่อให้ Tokenizer ตัดคำด้านในได้ชัดเจน
-    text = re.sub(r'"([^"]+)"', r' " \1 " ', text)
-    text = re.sub(r"'([^']+)'", r" ' \1 ' ", text)
+    # เติม space รอบ quote เพื่อไม่ให้ติดกับคำด้านใน
+    text = re.sub(r'"', ' " ', text)
+    text = re.sub(r"'", " ' ", text)
     return re.sub(r'\s+', ' ', text).strip()
 
 def postprocess_thai_output(text: str) -> str:
-    """ทำความสะอาดคำแปลภาษาไทยหลัง decode และจัดระยะเครื่องหมายคำพูด"""
-    # จัดช่องว่างรอบเครื่องหมายคำพูดให้มีระยะห่างพอเหมาะ
-    text = re.sub(r'["\']\s*([^"\']+?)\s*["\']', r' "\1" ', text)
-    # ตัดช่องว่างซ้ำซ้อน
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    """ทำความสะอาดคำแปลภาษาไทย จัดการระยะเครื่องหมายคำพูดให้ชิดคำ"""
+    # จัดช่องว่างรอบ quote ให้เป็นระเบียบ ไม่ติดคำจนอ่านไม่ออก
+    text = re.sub(r'\s*"\s*([^"]+?)\s*"\s*', r' "\1" ', text)
+    text = re.sub(r"\s*'\s*([^']+?)\s*'\s*", r" '\1' ", text)
+    return re.sub(r'\s+', ' ', text).strip()
 
 def encode_text(text: str):
     clean_text = normalize_text_input(text)
@@ -218,7 +213,7 @@ def decode_ids(ids):
     raw_decoded = sp.decode(clean_ids)
     return postprocess_thai_output(raw_decoded)
 
-def get_banned_ngram_tokens(generated_ids, ngram_size):
+def get_banned_ngram_tokens(generated_ids, ngram_size=3):
     if len(generated_ids) < ngram_size - 1:
         return set()
     prefix = tuple(generated_ids[-(ngram_size - 1):])
@@ -229,72 +224,47 @@ def get_banned_ngram_tokens(generated_ids, ngram_size):
             banned.add(ngram[-1])
     return banned
 
-# ==============================================================================
-# 5. Inference Engines (Beam Search & Greedy Decode)
-# ==============================================================================
 @torch.no_grad()
-def beam_search_translate(src_ids, beam_width=3, max_new_tokens=150, length_penalty=0.8):
-    """Beam Search เพื่อหาคำแปลที่ดีที่สุดและสละสลวยที่สุด beam_width ทางเลือก"""
+def greedy_translate(src_ids, max_new_tokens=120, repetition_penalty=1.3):
+    """Fast Greedy Search แบบดั้งเดิม (เร็วที่สุดบน CPU)"""
     src = torch.tensor([src_ids], dtype=torch.long, device=device)
     memory, memory_key_padding_mask = model.encode(src)
-    safe_max_len = min(max_new_tokens, MAX_LEN - 1)
 
-    beams = [([BOS_ID], 0.0)]
-    completed_beams = []
+    safe_max_len = min(max_new_tokens, MAX_LEN - 1)
+    tgt_ids = [BOS_ID]
 
     for _ in range(safe_max_len):
-        candidates = []
-        for seq, score in beams:
-            if seq[-1] == EOS_ID:
-                completed_beams.append((seq, score))
-                continue
+        tgt = torch.tensor([tgt_ids], dtype=torch.long, device=device)
+        logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
+        next_token_logits = logits[0, -1, :].clone()
 
-            tgt = torch.tensor([seq], dtype=torch.long, device=device)
-            logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
-            log_probs = torch.log_softmax(logits[0, -1, :], dim=-1)
+        # Multiplicative Repetition Penalty
+        for tok in set(tgt_ids):
+            if next_token_logits[tok] > 0:
+                next_token_logits[tok] /= repetition_penalty
+            else:
+                next_token_logits[tok] *= repetition_penalty
 
-            # Strict 3-gram Blocking
-            banned = get_banned_ngram_tokens(seq, ngram_size=3)
-            for tok in banned:
-                log_probs[tok] = float("-inf")
+        # Strict 3-gram Blocking กันพูดซ้ำ
+        banned = get_banned_ngram_tokens(tgt_ids, ngram_size=3)
+        for tok in banned:
+            next_token_logits[tok] = float("-inf")
 
-            top_k_probs, top_k_tokens = torch.topk(log_probs, beam_width)
-            for p, tok in zip(top_k_probs, top_k_tokens):
-                candidates.append((seq + [tok.item()], score + p.item()))
+        next_token = torch.argmax(next_token_logits).item()
+        tgt_ids.append(next_token)
 
-        if not candidates:
+        if next_token == EOS_ID:
             break
 
-        candidates.sort(key=lambda x: x[1] / (len(x[0]) ** length_penalty), reverse=True)
-        beams = candidates[:beam_width]
+    return tgt_ids
 
-        if all(seq[-1] == EOS_ID for seq, _ in beams):
-            completed_beams.extend(beams)
-            break
-
-    if not completed_beams:
-        completed_beams = beams
-
-    completed_beams.sort(key=lambda x: x[1] / (len(x[0]) ** length_penalty), reverse=True)
-    return completed_beams[:beam_width]
-
-def translate_sentence_with_alternatives(text: str, num_alternatives: int = 3):
+def translate_sentence(text: str) -> str:
     text_clean = text.strip()
     if not text_clean:
-        return "", []
+        return ""
     src_ids = encode_text(text_clean)
-    beams = beam_search_translate(src_ids, beam_width=num_alternatives)
-    
-    results = []
-    seen = set()
-    for seq, _ in beams:
-        decoded = decode_ids(seq)
-        if decoded and decoded not in seen:
-            results.append(decoded)
-            seen.add(decoded)
-            
-    primary = results[0] if results else ""
-    return primary, results
+    out_ids = greedy_translate(src_ids)
+    return decode_ids(out_ids)
 
 def split_document_into_sentences(text: str):
     paragraphs = text.split("\n")
@@ -318,12 +288,12 @@ def translate_document(document_text: str) -> str:
         if is_newline:
             translated_result.append("\n")
         else:
-            th_sent, _ = translate_sentence_with_alternatives(sent, num_alternatives=1)
+            th_sent = translate_sentence(sent)
             translated_result.append(th_sent + " ")
     return "".join(translated_result).strip()
 
 # ==============================================================================
-# 6. FastAPI Endpoints
+# 5. FastAPI Endpoints
 # ==============================================================================
 class TranslationRequest(BaseModel):
     text: str
@@ -331,7 +301,6 @@ class TranslationRequest(BaseModel):
 class TranslationResponse(BaseModel):
     original: str
     translated: str
-    alternatives: list[str] = []
 
 @app.get("/")
 def health_check():
@@ -343,18 +312,18 @@ def health_check():
 
 @app.post("/translate", response_model=TranslationResponse)
 def api_translate_sentence(req: TranslationRequest):
-    """Endpoint สำหรับแปลประโยคเดี่ยว (คืนค่าคำแปลหลักและคำแปลทางเลือก)"""
+    """แปลประโยคเดี่ยวสั้นๆ รวดเร็วด้วย Greedy Search"""
     try:
-        primary, alternatives = translate_sentence_with_alternatives(req.text, num_alternatives=3)
-        return TranslationResponse(original=req.text, translated=primary, alternatives=alternatives)
+        translated = translate_sentence(req.text)
+        return TranslationResponse(original=req.text, translated=translated)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/translate-document", response_model=TranslationResponse)
 def api_translate_document(req: TranslationRequest):
-    """Endpoint สำหรับแปลเอกสาร, ย่อหน้า, หรือบทความยาวทั้งหน้า"""
+    """แปลเอกสาร/ข้อความยาวทีละประโยค"""
     try:
         translated = translate_document(req.text)
-        return TranslationResponse(original=req.text, translated=translated, alternatives=[])
+        return TranslationResponse(original=req.text, translated=translated)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
