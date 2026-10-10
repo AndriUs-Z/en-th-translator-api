@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import unicodedata
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
@@ -182,16 +183,39 @@ model.eval()
 print(f"โหลดโมเดลสำเร็จจาก {MODEL_PATH} (Vocab size: {sp.get_piece_size()})")
 
 # ==============================================================================
-# 4. ฟังก์ชันช่วยเหลือและ Inference Engine
+# 4. ฟังก์ชันจัดการ Text Normalization & Post-processing
 # ==============================================================================
+def normalize_text_input(text: str) -> str:
+    """
+    แปลง curly quotes และสัญลักษณ์พิเศษให้อยู่ในรูปมาตรฐาน
+    เพื่อป้องกัน Tokenizer เกิดสถานะ <unk> (??)
+    """
+    text = unicodedata.normalize("NFKC", text)
+    # แปลงเครื่องหมายคำพูดโค้งทุกชนิดเป็น straight quotes
+    text = re.sub(r'[“”„«»]', '"', text)
+    text = re.sub(r"[‘’`´]", "'", text)
+    # เพิ่มช่องว่างรอบเครื่องหมายคำพูดเพื่อให้ Tokenizer ตัดคำด้านในได้ชัดเจน
+    text = re.sub(r'"([^"]+)"', r' " \1 " ', text)
+    text = re.sub(r"'([^']+)'", r" ' \1 ' ", text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+def postprocess_thai_output(text: str) -> str:
+    """ทำความสะอาดคำแปลภาษาไทยหลัง decode"""
+    # จัดระยะห่างรอบเครื่องหมายคำพูดให้กระชับ
+    text = re.sub(r'\s*"\s*([^"]+?)\s*"\s*', r' "\1" ', text)
+    text = re.sub(r"\s*'\s*([^']+?)\s*'\s*", r" '\1' ", text)
+    return re.sub(r'\s+', ' ', text).strip()
+
 def encode_text(text: str):
-    ids = sp.encode(text, out_type=int)
+    clean_text = normalize_text_input(text)
+    ids = sp.encode(clean_text, out_type=int)
     ids = [BOS_ID] + ids + [EOS_ID]
     return ids[:MAX_LEN]
 
 def decode_ids(ids):
     clean_ids = [i for i in ids if i not in (PAD_ID, BOS_ID, EOS_ID)]
-    return sp.decode(clean_ids)
+    raw_decoded = sp.decode(clean_ids)
+    return postprocess_thai_output(raw_decoded)
 
 def get_banned_ngram_tokens(generated_ids, ngram_size):
     if len(generated_ids) < ngram_size - 1:
@@ -204,46 +228,72 @@ def get_banned_ngram_tokens(generated_ids, ngram_size):
             banned.add(ngram[-1])
     return banned
 
+# ==============================================================================
+# 5. Inference Engines (Beam Search & Greedy Decode)
+# ==============================================================================
 @torch.no_grad()
-def greedy_translate(src_ids, max_new_tokens=150, no_repeat_ngram_size=3, repetition_penalty=1.3):
+def beam_search_translate(src_ids, beam_width=3, max_new_tokens=150, length_penalty=0.8):
+    """Beam Search เพื่อหาคำแปลที่ดีที่สุดและสละสลวยที่สุด beam_width ทางเลือก"""
     src = torch.tensor([src_ids], dtype=torch.long, device=device)
     memory, memory_key_padding_mask = model.encode(src)
-
     safe_max_len = min(max_new_tokens, MAX_LEN - 1)
-    tgt_ids = [BOS_ID]
+
+    beams = [([BOS_ID], 0.0)]
+    completed_beams = []
 
     for _ in range(safe_max_len):
-        tgt = torch.tensor([tgt_ids], dtype=torch.long, device=device)
-        logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
-        next_token_logits = logits[0, -1, :].clone()
+        candidates = []
+        for seq, score in beams:
+            if seq[-1] == EOS_ID:
+                completed_beams.append((seq, score))
+                continue
 
-        # Multiplicative Repetition Penalty
-        for tok in set(tgt_ids):
-            if next_token_logits[tok] > 0:
-                next_token_logits[tok] /= repetition_penalty
-            else:
-                next_token_logits[tok] *= repetition_penalty
+            tgt = torch.tensor([seq], dtype=torch.long, device=device)
+            logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
+            log_probs = torch.log_softmax(logits[0, -1, :], dim=-1)
 
-        # Strict N-gram Blocking
-        banned = get_banned_ngram_tokens(tgt_ids, no_repeat_ngram_size)
-        for tok in banned:
-            next_token_logits[tok] = float("-inf")
+            # Strict 3-gram Blocking
+            banned = get_banned_ngram_tokens(seq, ngram_size=3)
+            for tok in banned:
+                log_probs[tok] = float("-inf")
 
-        next_token = torch.argmax(next_token_logits).item()
-        tgt_ids.append(next_token)
+            top_k_probs, top_k_tokens = torch.topk(log_probs, beam_width)
+            for p, tok in zip(top_k_probs, top_k_tokens):
+                candidates.append((seq + [tok.item()], score + p.item()))
 
-        if next_token == EOS_ID:
+        if not candidates:
             break
 
-    return tgt_ids
+        candidates.sort(key=lambda x: x[1] / (len(x[0]) ** length_penalty), reverse=True)
+        beams = candidates[:beam_width]
 
-def translate_sentence(text: str) -> str:
+        if all(seq[-1] == EOS_ID for seq, _ in beams):
+            completed_beams.extend(beams)
+            break
+
+    if not completed_beams:
+        completed_beams = beams
+
+    completed_beams.sort(key=lambda x: x[1] / (len(x[0]) ** length_penalty), reverse=True)
+    return completed_beams[:beam_width]
+
+def translate_sentence_with_alternatives(text: str, num_alternatives: int = 3):
     text_clean = text.strip()
     if not text_clean:
-        return ""
+        return "", []
     src_ids = encode_text(text_clean)
-    out_ids = greedy_translate(src_ids)
-    return decode_ids(out_ids)
+    beams = beam_search_translate(src_ids, beam_width=num_alternatives)
+    
+    results = []
+    seen = set()
+    for seq, _ in beams:
+        decoded = decode_ids(seq)
+        if decoded and decoded not in seen:
+            results.append(decoded)
+            seen.add(decoded)
+            
+    primary = results[0] if results else ""
+    return primary, results
 
 def split_document_into_sentences(text: str):
     paragraphs = text.split("\n")
@@ -267,12 +317,12 @@ def translate_document(document_text: str) -> str:
         if is_newline:
             translated_result.append("\n")
         else:
-            th_sent = translate_sentence(sent)
+            th_sent, _ = translate_sentence_with_alternatives(sent, num_alternatives=1)
             translated_result.append(th_sent + " ")
     return "".join(translated_result).strip()
 
 # ==============================================================================
-# 5. FastAPI Endpoints
+# 6. FastAPI Endpoints
 # ==============================================================================
 class TranslationRequest(BaseModel):
     text: str
@@ -280,6 +330,7 @@ class TranslationRequest(BaseModel):
 class TranslationResponse(BaseModel):
     original: str
     translated: str
+    alternatives: list[str] = []
 
 @app.get("/")
 def health_check():
@@ -291,10 +342,10 @@ def health_check():
 
 @app.post("/translate", response_model=TranslationResponse)
 def api_translate_sentence(req: TranslationRequest):
-    """Endpoint สำหรับแปลประโยคเดี่ยวสั้น ๆ"""
+    """Endpoint สำหรับแปลประโยคเดี่ยว (คืนค่าคำแปลหลักและคำแปลทางเลือก)"""
     try:
-        translated = translate_sentence(req.text)
-        return TranslationResponse(original=req.text, translated=translated)
+        primary, alternatives = translate_sentence_with_alternatives(req.text, num_alternatives=3)
+        return TranslationResponse(original=req.text, translated=primary, alternatives=alternatives)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -303,6 +354,6 @@ def api_translate_document(req: TranslationRequest):
     """Endpoint สำหรับแปลเอกสาร, ย่อหน้า, หรือบทความยาวทั้งหน้า"""
     try:
         translated = translate_document(req.text)
-        return TranslationResponse(original=req.text, translated=translated)
+        return TranslationResponse(original=req.text, translated=translated, alternatives=[])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
