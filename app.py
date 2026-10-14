@@ -10,14 +10,14 @@ import torch
 import torch.nn as nn
 
 # ==============================================================================
-# 1. การตั้งค่า Resource
+# 1. การตั้งค่า Resource (จำกัด Thread เพื่อประหยัด RAM บน Render)
 # ==============================================================================
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 device = torch.device("cpu")
 
 # ==============================================================================
-# 2. Hyperparameters
+# 2. Hyperparameters & File Paths
 # ==============================================================================
 D_MODEL = 256
 NHEAD = 8
@@ -33,15 +33,15 @@ MAX_NEW_TOKENS = 64
 NO_REPEAT_NGRAM_SIZE = 3
 REPETITION_PENALTY = 1.2
 
-# ใช้แค่ EN-TH ไปก่อน
+# ใช้ไฟล์ต้นฉบับ 32-bit ที่คุณภาพการแปลดีที่สุด (ไม่ใช้ Quantization)
 SPM_EN_TH_PATH = os.getenv("SPM_EN_TH_PATH", "sp_en_th.model")
-MODEL_EN_TH_PATH = os.getenv("MODEL_EN_TH_PATH", "q_finetuned_model.pt")
+MODEL_EN_TH_PATH = os.getenv("MODEL_EN_TH_PATH", "finetuned_model.pt")
 
 # ==============================================================================
 # 3. โหลด Tokenizer (เฉพาะ EN-TH)
 # ==============================================================================
 if not os.path.exists(SPM_EN_TH_PATH):
-    raise FileNotFoundError(f"ไม่พบไฟล์: {SPM_EN_TH_PATH}")
+    raise FileNotFoundError(f"ไม่พบไฟล์พจนานุกรม: {SPM_EN_TH_PATH}")
 
 print("[*] กำลังโหลด SentencePiece Tokenizer (EN-TH)...")
 sp_en_th = spm.SentencePieceProcessor(model_file=SPM_EN_TH_PATH)
@@ -50,10 +50,6 @@ vocab_size_en_th = sp_en_th.get_piece_size()
 PAD_ID = sp_en_th.pad_id() if sp_en_th.pad_id() != -1 else 0
 BOS_ID = sp_en_th.bos_id() if sp_en_th.bos_id() != -1 else 2
 EOS_ID = sp_en_th.eos_id() if sp_en_th.eos_id() != -1 else 3
-
-# ปิด TH-EN ชั่วคราว
-sp_th_en = None
-model_th_en = None
 
 # ==============================================================================
 # 4. Model Classes
@@ -141,33 +137,30 @@ class RNNAugmentedTransformer(nn.Module):
         return self.output_proj(x)
 
 # ==============================================================================
-# 5. โหลด Checkpoints
+# 5. โหลด Checkpoints แบบ 32-bit เต็ม (แปลเป๊ะเหมือนเดิม)
 # ==============================================================================
-def load_quantized_checkpoint(model_path, target_vocab_size):
+def load_checkpoint_safe(model_path, target_vocab_size):
     if not os.path.exists(model_path):
         print(f"[!] ไม่พบไฟล์ {model_path}")
         return None
         
     model = RNNAugmentedTransformer(vocab_size=target_vocab_size).to(device)
-    model.eval()
     
-    model = torch.quantization.quantize_dynamic(
-        model, {nn.Linear, nn.GRU}, dtype=torch.qint8
-    )
-    
-    # weights_only=False เพื่อให้โหลด ScriptObject ของโมเดลบีบอัดได้
+    # weights_only=False เผื่อไฟล์เซฟมาติด dict wrapper ของ PyTorch
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     
     model.load_state_dict(state_dict)
+    model.eval()
+    
     del ckpt, state_dict
     gc.collect()
     
-    print(f"[+] โหลดโมเดลบีบอัด {model_path} สำเร็จ")
+    print(f"[+] โหลดโมเดล 32-bit {model_path} สำเร็จ")
     return model
 
-print("[*] กำลังโหลดเฉพาะโมเดล EN-TH ...")
-model_en_th = load_quantized_checkpoint(MODEL_EN_TH_PATH, vocab_size_en_th)
+print("[*] กำลังโหลดโมเดล EN-TH แบบคุณภาพสูง (เต็มประสิทธิภาพ)...")
+model_en_th = load_checkpoint_safe(MODEL_EN_TH_PATH, vocab_size_en_th)
 print("[+] โหลดเสร็จสิ้น ระบบพร้อมทำงาน")
 
 # ==============================================================================
@@ -213,6 +206,7 @@ def greedy_translate(model, src_ids):
 def translate_long_text(model, text: str, target_sp) -> str:
     if not text or not text.strip(): return ""
     
+    # หั่นประโยคตามเครื่องหมายและบรรทัดใหม่
     sentences = re.split(r'(?<=[.!?\n])\s+', text.strip())
     translated_chunks = []
     
@@ -227,7 +221,7 @@ def translate_long_text(model, text: str, target_sp) -> str:
 # ==============================================================================
 # 7. FastAPI Endpoints
 # ==============================================================================
-app = FastAPI(title="CS EN-TH Translation API", version="6.0 (EN-TH Only)")
+app = FastAPI(title="CS Translator API (EN-TH Microservice)", version="1.0")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -245,10 +239,8 @@ class TranslationResponse(BaseModel):
 def health_check():
     return {
         "status": "online",
-        "models_loaded": {
-            "en-th": model_en_th is not None,
-            "th-en": False  # ปิดการใช้งานชั่วคราว
-        }
+        "service": "EN-TH Translator Microservice",
+        "model_loaded": model_en_th is not None
     }
 
 @app.post("/translate", response_model=TranslationResponse)
@@ -256,20 +248,19 @@ def translate(req: TranslationRequest):
     direction = req.direction.strip().lower()
     input_text = req.text.strip()
 
-    if direction == "th-en":
-        # แจ้งเตือน 503 กลับไปที่หน้าเว็บถ้ายิงมาตอนโมเดลยังไม่เสร็จ
+    # ระบบนี้เปิดรับเฉพาะ EN-TH เท่านั้น
+    if direction != "en-th":
         raise HTTPException(
-            status_code=503,
-            detail="โมเดล TH-EN กำลังอยู่ระหว่างการเทรน ยังไม่พร้อมใช้งานในขณะนี้ครับ"
+            status_code=400,
+            detail="API endpoint นี้รองรับเฉพาะการแปล 'en-th' (อังกฤษ -> ไทย) เท่านั้น สำหรับ 'th-en' กรุณาใช้ endpoint อื่น"
         )
-    else:
-        direction = "en-th"
-        target_model = model_en_th
-        target_sp = sp_en_th
-        input_text = input_text.lower()  # ป้องกันปัญหา Dog แปลเพี้ยน
 
-    if target_model is None:
-        raise HTTPException(status_code=503, detail="ไฟล์โมเดล EN-TH ไม่พร้อมใช้งาน")
+    if model_en_th is None:
+        raise HTTPException(status_code=503, detail="ไฟล์โมเดล EN-TH ยังไม่พร้อมใช้งาน")
 
-    result = translate_long_text(target_model, input_text, target_sp)
-    return TranslationResponse(translated_text=result, direction=direction)
+    # แปลงเป็นตัวพิมพ์เล็กทั้งหมดเพื่อแก้บั๊กคำนามพิมพ์ใหญ่แปลเพี้ยน
+    input_text = input_text.lower()
+
+    # หั่นประโยคและแปล
+    result = translate_long_text(model_en_th, input_text, sp_en_th)
+    return TranslationResponse(translated_text=result, direction="en-th")
