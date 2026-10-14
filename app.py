@@ -162,7 +162,7 @@ def load_quantized_checkpoint(model_path, target_vocab_size):
     )
     
     # โหลดน้ำหนัก (state_dict) ที่บีบอัดมาจาก Colab
-    ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     
     # เช็คเผื่อกรณีไฟล์ถูกห่อด้วย key "model_state_dict" (ป้องกัน Error)
     state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
