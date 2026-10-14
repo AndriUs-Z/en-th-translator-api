@@ -10,14 +10,14 @@ import torch
 import torch.nn as nn
 
 # ==============================================================================
-# 1. การตั้งค่า Resource (จำกัด Thread เซฟ RAM)
+# 1. การตั้งค่า Resource
 # ==============================================================================
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 device = torch.device("cpu")
 
 # ==============================================================================
-# 2. Hyperparameters & File Paths
+# 2. Hyperparameters
 # ==============================================================================
 D_MODEL = 256
 NHEAD = 8
@@ -33,31 +33,27 @@ MAX_NEW_TOKENS = 64
 NO_REPEAT_NGRAM_SIZE = 3
 REPETITION_PENALTY = 1.2
 
+# ใช้แค่ EN-TH ไปก่อน
 SPM_EN_TH_PATH = os.getenv("SPM_EN_TH_PATH", "sp_en_th.model")
-SPM_TH_EN_PATH = os.getenv("SPM_TH_EN_PATH", "sp_th_en.model")
-
-# เปลี่ยนชื่อไฟล์ให้ตรงกับไฟล์ที่บีบอัดแล้ว (8-bit)
 MODEL_EN_TH_PATH = os.getenv("MODEL_EN_TH_PATH", "q_finetuned_model.pt")
-MODEL_TH_EN_PATH = os.getenv("MODEL_TH_EN_PATH", "best_model_th_en.pt")
 
 # ==============================================================================
-# 3. โหลด Tokenizer แยก 2 ตัว
+# 3. โหลด Tokenizer (เฉพาะ EN-TH)
 # ==============================================================================
 if not os.path.exists(SPM_EN_TH_PATH):
     raise FileNotFoundError(f"ไม่พบไฟล์: {SPM_EN_TH_PATH}")
-if not os.path.exists(SPM_TH_EN_PATH):
-    raise FileNotFoundError(f"ไม่พบไฟล์: {SPM_TH_EN_PATH}")
 
-print("[*] กำลังโหลด SentencePiece Tokenizers...")
+print("[*] กำลังโหลด SentencePiece Tokenizer (EN-TH)...")
 sp_en_th = spm.SentencePieceProcessor(model_file=SPM_EN_TH_PATH)
-sp_th_en = spm.SentencePieceProcessor(model_file=SPM_TH_EN_PATH)
-
 vocab_size_en_th = sp_en_th.get_piece_size()
-vocab_size_th_en = sp_th_en.get_piece_size()
 
 PAD_ID = sp_en_th.pad_id() if sp_en_th.pad_id() != -1 else 0
 BOS_ID = sp_en_th.bos_id() if sp_en_th.bos_id() != -1 else 2
 EOS_ID = sp_en_th.eos_id() if sp_en_th.eos_id() != -1 else 3
+
+# ปิด TH-EN ชั่วคราว
+sp_th_en = None
+model_th_en = None
 
 # ==============================================================================
 # 4. Model Classes
@@ -145,38 +141,33 @@ class RNNAugmentedTransformer(nn.Module):
         return self.output_proj(x)
 
 # ==============================================================================
-# 5. โหลด Checkpoints ที่ผ่านการบีบอัด (Quantized) มาแล้ว
+# 5. โหลด Checkpoints
 # ==============================================================================
 def load_quantized_checkpoint(model_path, target_vocab_size):
     if not os.path.exists(model_path):
         print(f"[!] ไม่พบไฟล์ {model_path}")
         return None
         
-    # สร้างโครงสร้างโมเดลเปล่า
     model = RNNAugmentedTransformer(vocab_size=target_vocab_size).to(device)
     model.eval()
     
-    # **สำคัญมาก:** ต้องจำลองการบีบอัดโครงสร้างก่อน เพื่อให้มันรับกับน้ำหนัก 8-bit ที่จะโหลดเข้ามา
     model = torch.quantization.quantize_dynamic(
         model, {nn.Linear, nn.GRU}, dtype=torch.qint8
     )
     
-    # โหลดน้ำหนัก (state_dict) ที่บีบอัดมาจาก Colab
+    # weights_only=False เพื่อให้โหลด ScriptObject ของโมเดลบีบอัดได้
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-    
-    # เช็คเผื่อกรณีไฟล์ถูกห่อด้วย key "model_state_dict" (ป้องกัน Error)
     state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     
     model.load_state_dict(state_dict)
     del ckpt, state_dict
     gc.collect()
     
-    print(f"[+] โหลดโมเดลบีบอัด {model_path} สำเร็จ (vocab_size={target_vocab_size})")
+    print(f"[+] โหลดโมเดลบีบอัด {model_path} สำเร็จ")
     return model
 
-print("[*] กำลังโหลดโมเดลเข้าหน่วยความจำ (สามารถโหลด 2 ตัวพร้อมกันได้ เพราะกิน RAM น้อยลง)...")
+print("[*] กำลังโหลดเฉพาะโมเดล EN-TH ...")
 model_en_th = load_quantized_checkpoint(MODEL_EN_TH_PATH, vocab_size_en_th)
-model_th_en = load_quantized_checkpoint(MODEL_TH_EN_PATH, vocab_size_th_en)
 print("[+] โหลดเสร็จสิ้น ระบบพร้อมทำงาน")
 
 # ==============================================================================
@@ -221,3 +212,64 @@ def greedy_translate(model, src_ids):
 
 def translate_long_text(model, text: str, target_sp) -> str:
     if not text or not text.strip(): return ""
+    
+    sentences = re.split(r'(?<=[.!?\n])\s+', text.strip())
+    translated_chunks = []
+    
+    for sentence in sentences:
+        if not sentence.strip(): continue
+        src_ids = encode_text(sentence.strip(), target_sp)
+        out_ids = greedy_translate(model, src_ids)
+        translated_chunks.append(decode_ids(out_ids, target_sp))
+        
+    return " ".join(translated_chunks)
+
+# ==============================================================================
+# 7. FastAPI Endpoints
+# ==============================================================================
+app = FastAPI(title="CS EN-TH Translation API", version="6.0 (EN-TH Only)")
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+class TranslationRequest(BaseModel):
+    text: str
+    direction: str = "en-th"
+
+class TranslationResponse(BaseModel):
+    translated_text: str
+    direction: str
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "models_loaded": {
+            "en-th": model_en_th is not None,
+            "th-en": False  # ปิดการใช้งานชั่วคราว
+        }
+    }
+
+@app.post("/translate", response_model=TranslationResponse)
+def translate(req: TranslationRequest):
+    direction = req.direction.strip().lower()
+    input_text = req.text.strip()
+
+    if direction == "th-en":
+        # แจ้งเตือน 503 กลับไปที่หน้าเว็บถ้ายิงมาตอนโมเดลยังไม่เสร็จ
+        raise HTTPException(
+            status_code=503,
+            detail="โมเดล TH-EN กำลังอยู่ระหว่างการเทรน ยังไม่พร้อมใช้งานในขณะนี้ครับ"
+        )
+    else:
+        direction = "en-th"
+        target_model = model_en_th
+        target_sp = sp_en_th
+        input_text = input_text.lower()  # ป้องกันปัญหา Dog แปลเพี้ยน
+
+    if target_model is None:
+        raise HTTPException(status_code=503, detail="ไฟล์โมเดล EN-TH ไม่พร้อมใช้งาน")
+
+    result = translate_long_text(target_model, input_text, target_sp)
+    return TranslationResponse(translated_text=result, direction=direction)
