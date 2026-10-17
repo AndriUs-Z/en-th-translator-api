@@ -1,0 +1,62 @@
+# วางใน repo API ของทิศทาง en-th (repo นี้เทรน en-th อย่างเดียว และ push โมเดลกลับ repo นี้เอง)
+name: Retrain Model
+
+on:
+  repository_dispatch:
+    types: [retrain]        # payload: { jobs: {"en-th": "<job_id>"} }  ยิงมาจาก POST /api/admin/retrain
+  workflow_dispatch:         # กดรันเองเพื่อทดสอบได้ (จะไม่อัปเดตสถานะบน Dashboard)
+
+concurrency:
+  group: retrain
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  DIRECTION: en-th
+  BASE_CKPT: best_model.pt
+  OUT_FILE: finetuned_model.pt
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: retrain/requirements-retrain.txt
+
+      - name: Download base model (Release "base-models")
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download base-models --pattern "$BASE_CKPT" --dir retrain/base
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r retrain/requirements-retrain.txt
+
+      - name: Retrain
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOBS_JSON: ${{ toJSON(github.event.client_payload.jobs) }}
+          TABLE_PAIRS: ${{ vars.TABLE_PAIRS }}
+          N_GENERAL_REPLAY: ${{ vars.N_GENERAL_REPLAY || '6000' }}
+          N_TECHNICAL_REPLAY: ${{ vars.N_TECHNICAL_REPLAY || '2000' }}
+          N_GENERAL_VAL: ${{ vars.N_GENERAL_VAL || '1000' }}
+        run: python retrain/retrain.py --direction "$DIRECTION"
+
+      - name: Commit & push new model
+        run: |
+          git config user.name  "retrain-bot"
+          git config user.email "retrain-bot@users.noreply.github.com"
+          git add "$OUT_FILE"
+          git commit -m "chore: update en-th model [$(date -u +%F\ %H:%M)]" || echo "no changes"
+          git pull --rebase --autostash
+          git push
