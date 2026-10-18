@@ -62,7 +62,7 @@ CS_DEV_FRACTION = float(os.getenv("CS_DEV_FRACTION", "0"))  # 0 = เทรน�
 FORGET_TOL = 0.02                       # general val loss แย่ลงได้ไม่เกิน 2%
 ALPHAS = [1.0, 0.8, 0.6, 0.4, 0.2]
 SEED = int(os.getenv("SEED", "42"))
-MIN_PAIRS = int(os.getenv("MIN_PAIRS", "10"))
+MIN_PAIRS = int(os.getenv("MIN_PAIRS", "100"))   # ต้องมี feedback approved อย่างน้อยกี่คู่ถึงจะเทรน
 
 # ขนาดชุดข้อมูล: ค่า default ลดลงจาก Notebook (25k/10k/2k) เพราะรันบน CPU ของ GitHub
 # เพิ่มได้ผ่าน env/Variables ถ้ายอมให้ใช้เวลานานขึ้น (ดูหมายเหตุในคู่มือ)
