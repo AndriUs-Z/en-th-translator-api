@@ -5,10 +5,9 @@ import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 import sentencepiece as spm
 
-from preprocess import preprocess_en, restore_unknown, unknown_spans
+from preprocess import preprocess_en, restore_unknown
 import torch
 import torch.nn as nn
 
@@ -34,7 +33,6 @@ MAX_LEN = 128
 
 # ตั้งให้ตรงกับ notebook ตอนวัด BLEU (เดิม 64 / 1.2 และไม่ได้ใช้ no-repeat n-gram)
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "150"))
-MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "5000"))
 NO_REPEAT_NGRAM_SIZE = 3
 REPETITION_PENALTY = 1.3
 
@@ -247,18 +245,7 @@ def greedy_translate(model, src_ids):
 
     return tgt_ids
 
-# ---------------------------------------------------------------------------
-# ดูการตัดคำ (debug)
-# ตั้ง ENABLE_DEBUG=false บน Render เพื่อปิด /tokenize และ debug ใน /translate
-# ---------------------------------------------------------------------------
-DEBUG_ENABLED = os.getenv("ENABLE_DEBUG", "true").strip().lower() not in ("0", "false", "no")
-
-
-def describe_tokens(ids, sp):
-    return [{"id": int(i), "piece": sp.id_to_piece(int(i))} for i in ids]
-
-
-def translate_long_text(model, text: str, target_sp, trace=None) -> str:
+def translate_long_text(model, text: str, target_sp) -> str:
     if not text or not text.strip(): return ""
     
     # หั่นประโยคตามเครื่องหมายและบรรทัดใหม่
@@ -269,11 +256,7 @@ def translate_long_text(model, text: str, target_sp, trace=None) -> str:
         if not sentence.strip(): continue
         src_ids = encode_text(sentence.strip(), target_sp)
         out_ids = greedy_translate(model, src_ids)
-        piece = restore_unknown(decode_ids(out_ids, target_sp), sentence.strip(), target_sp)
-        translated_chunks.append(piece)
-        if trace is not None:
-            trace.append({"chunk": sentence.strip(), "source_tokens": describe_tokens(src_ids, target_sp),
-                          "output_tokens": describe_tokens(out_ids, target_sp), "output_text": piece})
+        translated_chunks.append(restore_unknown(decode_ids(out_ids, target_sp), sentence.strip(), target_sp))
         
     return " ".join(translated_chunks)
 
@@ -289,12 +272,10 @@ app.add_middleware(
 class TranslationRequest(BaseModel):
     text: str
     direction: str = "en-th"
-    debug: bool = False  # true = แนบผลการตัดคำมาใน response
 
 class TranslationResponse(BaseModel):
     translated_text: str
     direction: str
-    debug: Optional[dict] = None
 
 @app.get("/")
 def health_check():
@@ -304,7 +285,7 @@ def health_check():
         "model_loaded": model_en_th is not None
     }
 
-@app.post("/translate", response_model=TranslationResponse, response_model_exclude_none=True)
+@app.post("/translate", response_model=TranslationResponse)
 def translate(req: TranslationRequest):
     direction = req.direction.strip().lower()
     input_text = req.text.strip()
@@ -324,31 +305,5 @@ def translate(req: TranslationRequest):
     input_text = preprocess_en(input_text)
 
     # หั่นประโยคและแปล
-    trace = [] if (req.debug and DEBUG_ENABLED) else None
-    result = translate_long_text(model_en_th, input_text, sp_en_th, trace=trace)
-    debug = {"preprocessed_text": input_text, "chunks": trace} if trace is not None else None
-    return TranslationResponse(translated_text=result, direction="en-th", debug=debug)
-
-
-class TokenizeRequest(BaseModel):
-    text: str
-
-
-@app.post("/tokenize")
-def tokenize(req: TokenizeRequest):
-    """ดูว่า SentencePiece ตัดข้อความเป็นชิ้นคำย่อย (subword) อย่างไร โดยไม่แปล"""
-    if not DEBUG_ENABLED:
-        raise HTTPException(status_code=404, detail="ปิดการใช้งาน debug อยู่ (ENABLE_DEBUG=false)")
-    original = req.text.strip()
-    if len(original) > MAX_INPUT_CHARS:
-        raise HTTPException(status_code=413, detail=f"ข้อความยาวเกิน {MAX_INPUT_CHARS} ตัวอักษร")
-    pre = preprocess_en(original)
-    ids = sp_en_th.encode(pre, out_type=int)
-    return {
-        "original_text": original,
-        "preprocessed_text": pre,
-        "token_count": len(ids),
-        "tokens": describe_tokens(ids, sp_en_th),
-        "pieces_joined": " | ".join(sp_en_th.id_to_piece(i) for i in ids),
-        "unknown_characters": unknown_spans(pre, sp_en_th),
-    }
+    result = translate_long_text(model_en_th, input_text, sp_en_th)
+    return TranslationResponse(translated_text=result, direction="en-th")
