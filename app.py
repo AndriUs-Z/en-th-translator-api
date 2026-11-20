@@ -29,9 +29,10 @@ DIM_FEEDFORWARD = 512
 DROPOUT = 0.1
 MAX_LEN = 128
 
-MAX_NEW_TOKENS = 64
+# ตั้งให้ตรงกับ notebook ตอนวัด BLEU (เดิม 64 / 1.2 และไม่ได้ใช้ no-repeat n-gram)
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "150"))
 NO_REPEAT_NGRAM_SIZE = 3
-REPETITION_PENALTY = 1.2
+REPETITION_PENALTY = 1.3
 
 # ใช้ไฟล์ต้นฉบับ 32-bit ที่คุณภาพการแปลดีที่สุด (ไม่ใช้ Quantization)
 SPM_EN_TH_PATH = os.getenv("SPM_EN_TH_PATH", "sp_en_th.model")
@@ -54,6 +55,28 @@ EOS_ID = sp_en_th.eos_id() if sp_en_th.eos_id() != -1 else 3
 # ==============================================================================
 # 4. Model Classes
 # ==============================================================================
+
+# ---------------------------------------------------------------------------
+# แปลงชื่อ layer ของ checkpoint ให้ตรงกับคลาสนี้
+# notebook Kaggle รุ่นใหม่ตั้งชื่อ LayerNorm เป็น n1..n4 และ attention ของ encoder เป็น attn
+# ส่วนคลาสใน repo นี้ใช้ norm1..norm4 / self_attn  (สถาปัตยกรรมเหมือนกันทุกอย่าง ต่างแค่ชื่อ)
+# ฟังก์ชันนี้ทำให้โหลดได้ทั้ง checkpoint รุ่นเก่าและรุ่นใหม่
+# ---------------------------------------------------------------------------
+_STATE_DICT_RENAMES = [
+    (re.compile(r"^(encoder_layers\.\d+)\.attn\."), r"\1.self_attn."),
+    (re.compile(r"^((?:en|de)coder_layers\.\d+)\.n(\d)\."), r"\1.norm\2."),
+]
+
+
+def normalize_state_dict_keys(state_dict):
+    out = {}
+    for k, v in state_dict.items():
+        for pat, repl in _STATE_DICT_RENAMES:
+            k = pat.sub(repl, k)
+        out[k] = v
+    return out
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=MAX_LEN, dropout=0.1):
         super().__init__()
@@ -150,7 +173,7 @@ def load_checkpoint_safe(model_path, target_vocab_size):
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     
-    model.load_state_dict(state_dict)
+    model.load_state_dict(normalize_state_dict_keys(state_dict))
     model.eval()
     
     del ckpt, state_dict
@@ -168,12 +191,26 @@ print("[+] โหลดเสร็จสิ้น ระบบพร้อม�
 # ==============================================================================
 def encode_text(text: str, target_sp, add_bos_eos: bool = True):
     ids = target_sp.encode(text, out_type=int)
-    if add_bos_eos: ids = [BOS_ID] + ids + [EOS_ID]
+    if add_bos_eos:
+        # ตัดเนื้อหาก่อนแล้วค่อยใส่ BOS/EOS (เดิมตัดทีหลังทำให้ EOS หายเมื่อประโยคยาวเกิน)
+        ids = [BOS_ID] + ids[: MAX_LEN - 2] + [EOS_ID]
     return ids[:MAX_LEN]
 
 def decode_ids(ids, target_sp):
     ids = [i for i in ids if i not in (PAD_ID, BOS_ID, EOS_ID)]
     return target_sp.decode(ids)
+
+def get_banned_ngram_tokens(generated_ids, ngram_size):
+    if len(generated_ids) < ngram_size - 1:
+        return set()
+    prefix = tuple(generated_ids[-(ngram_size - 1):])
+    banned = set()
+    for i in range(len(generated_ids) - ngram_size + 1):
+        ngram = tuple(generated_ids[i: i + ngram_size])
+        if ngram[:-1] == prefix:
+            banned.add(ngram[-1])
+    return banned
+
 
 @torch.no_grad()
 def greedy_translate(model, src_ids):
@@ -183,23 +220,26 @@ def greedy_translate(model, src_ids):
 
     safe_max_len = min(MAX_NEW_TOKENS, MAX_LEN - 1)
     tgt_ids = [BOS_ID]
-    seen_tokens = set()
 
     for _ in range(safe_max_len):
         tgt = torch.tensor([tgt_ids], dtype=torch.long, device=device)
         logits = model.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
         next_token_logits = logits[0, -1, :].clone()
 
-        if REPETITION_PENALTY != 1.0 and seen_tokens:
-            for tok in seen_tokens:
-                if next_token_logits[tok] > 0: next_token_logits[tok] /= REPETITION_PENALTY
-                else: next_token_logits[tok] *= REPETITION_PENALTY
+        # repetition penalty + no-repeat n-gram: เหมือน notebook Cell 11 ทุกประการ
+        for tok in set(tgt_ids):
+            if next_token_logits[tok] > 0:
+                next_token_logits[tok] /= REPETITION_PENALTY
+            else:
+                next_token_logits[tok] *= REPETITION_PENALTY
+
+        for tok in get_banned_ngram_tokens(tgt_ids, NO_REPEAT_NGRAM_SIZE):
+            next_token_logits[tok] = float("-inf")
 
         next_token = torch.argmax(next_token_logits).item()
         tgt_ids.append(next_token)
-        seen_tokens.add(next_token)
-
-        if next_token == EOS_ID: break
+        if next_token == EOS_ID:
+            break
 
     return tgt_ids
 

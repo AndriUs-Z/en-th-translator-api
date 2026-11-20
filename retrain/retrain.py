@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from supabase import create_client
 from torch.utils.data import DataLoader, Dataset
 
-from model_def import BOS_ID, EOS_ID, MAX_LEN, PAD_ID, RNNAugmentedTransformer
+from model_def import BOS_ID, EOS_ID, MAX_LEN, PAD_ID, RNNAugmentedTransformer, normalize_state_dict_keys
 
 # ---------------- Paths / Env ----------------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -210,7 +210,7 @@ def train_direction(direction):
     model = RNNAugmentedTransformer(vocab_size=sp.get_piece_size()).to(device)
     base_path = os.path.join(BASE_DIR, cfg["base_ckpt"])
     ckpt = torch.load(base_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(normalize_state_dict_keys(ckpt.get("model_state_dict", ckpt)))
     pre_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     use_kd = cfg["kd_weight"] > 0
     teacher = None

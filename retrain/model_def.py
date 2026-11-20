@@ -3,6 +3,7 @@ model_def.py - สถาปัตยกรรมโมเดล (คัดลอ
 เพิ่มเฉพาะเมธอด forward() สำหรับ training
 """
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -196,3 +197,24 @@ class RNNAugmentedTransformer(nn.Module):
     """ใช้ตอน train: คืน logits ของ decoder (ไม่มี parameter เพิ่ม จึงโหลด checkpoint เดิมได้)"""
     memory, memory_key_padding_mask = self.encode(src)
     return self.decode(tgt, memory, memory_key_padding_mask=memory_key_padding_mask)
+
+
+# ---------------------------------------------------------------------------
+# แปลงชื่อ layer ของ checkpoint ให้ตรงกับคลาสนี้
+# notebook Kaggle รุ่นใหม่ตั้งชื่อ LayerNorm เป็น n1..n4 และ attention ของ encoder เป็น attn
+# ส่วนคลาสใน repo นี้ใช้ norm1..norm4 / self_attn  (สถาปัตยกรรมเหมือนกันทุกอย่าง ต่างแค่ชื่อ)
+# ฟังก์ชันนี้ทำให้โหลดได้ทั้ง checkpoint รุ่นเก่าและรุ่นใหม่
+# ---------------------------------------------------------------------------
+_STATE_DICT_RENAMES = [
+    (re.compile(r"^(encoder_layers\.\d+)\.attn\."), r"\1.self_attn."),
+    (re.compile(r"^((?:en|de)coder_layers\.\d+)\.n(\d)\."), r"\1.norm\2."),
+]
+
+
+def normalize_state_dict_keys(state_dict):
+    out = {}
+    for k, v in state_dict.items():
+        for pat, repl in _STATE_DICT_RENAMES:
+            k = pat.sub(repl, k)
+        out[k] = v
+    return out
