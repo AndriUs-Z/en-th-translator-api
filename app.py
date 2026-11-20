@@ -6,6 +6,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sentencepiece as spm
+
+from preprocess import preprocess_en, restore_unknown
 import torch
 import torch.nn as nn
 
@@ -254,7 +256,7 @@ def translate_long_text(model, text: str, target_sp) -> str:
         if not sentence.strip(): continue
         src_ids = encode_text(sentence.strip(), target_sp)
         out_ids = greedy_translate(model, src_ids)
-        translated_chunks.append(decode_ids(out_ids, target_sp))
+        translated_chunks.append(restore_unknown(decode_ids(out_ids, target_sp), sentence.strip(), target_sp))
         
     return " ".join(translated_chunks)
 
@@ -298,8 +300,9 @@ def translate(req: TranslationRequest):
     if model_en_th is None:
         raise HTTPException(status_code=503, detail="ไฟล์โมเดล EN-TH ยังไม่พร้อมใช้งาน")
 
-    # แปลงเป็นตัวพิมพ์เล็กทั้งหมดเพื่อแก้บั๊กคำนามพิมพ์ใหญ่แปลเพี้ยน
-    input_text = input_text.lower()
+    # ไม่แปลงเป็นตัวพิมพ์เล็กแล้ว: โมเดลแยกตัวพิมพ์เล็ก/ใหญ่ และเทรนกับข้อความตัวพิมพ์ปกติ
+    # (เดิม .lower() ทำให้ "Jan 5" -> "jan 5" แล้วแปลเป็น "เจียน 5")
+    input_text = preprocess_en(input_text)
 
     # หั่นประโยคและแปล
     result = translate_long_text(model_en_th, input_text, sp_en_th)
