@@ -60,7 +60,10 @@ KD_TEMP = 2.0
 CS_MAX_REPEAT = 5
 CS_DEV_FRACTION = float(os.getenv("CS_DEV_FRACTION", "0"))  # 0 = เทรนด้วย feedback ทั้งหมด (แนะนำ); >0 = กันบางส่วนไว้วัดผล (ใช้เมื่อมี >=50 คู่)
 FORGET_TOL = 0.02                       # general val loss แย่ลงได้ไม่เกิน 2%
-ALPHAS = [1.0, 0.8, 0.6, 0.4, 0.2]
+# จำกัด alpha สูงสุดไว้ที่ 0.3: ที่ alpha สูง โมเดลเรียน "ทางลัด" จากรูปแบบคลังศัพท์
+# (EN->TH คำเดี่ยวกลายเป็นนิยามยาว, TH->EN วลีคำนามถูกย่อเหลือคำเดียว) ซึ่ง validation loss จับไม่ได้
+MAX_ALPHA = float(os.getenv("MAX_ALPHA", "0.3"))
+ALPHAS = [a for a in (1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.1) if a <= MAX_ALPHA + 1e-9]
 SEED = int(os.getenv("SEED", "42"))
 MIN_PAIRS = int(os.getenv("MIN_PAIRS", "1"))   # ต้องมี feedback approved อย่างน้อยกี่คู่ถึงจะเทรน
 
